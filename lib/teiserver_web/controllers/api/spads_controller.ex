@@ -3,6 +3,7 @@ defmodule TeiserverWeb.API.SpadsController do
   alias Teiserver.Config
   alias Teiserver.{Account, Coordinator, Battle}
   alias Teiserver.Battle.{BalanceLib, MatchLib}
+  alias Teiserver.Lobby.LobbyLib
   import Teiserver.Helper.NumberHelper, only: [int_parse: 1]
   require Logger
 
@@ -123,11 +124,42 @@ defmodule TeiserverWeb.API.SpadsController do
         |> render("empty.json")
 
       balance_enabled == true ->
+        # Determine whether this is a ranked lobby.
+        # Note: teiserver treats absence of the modoption as ranked by default.
+        ranked? =
+          case LobbyLib.get_modoptions(client.lobby_id) do
+            nil ->
+              true
+
+            modoptions when is_map(modoptions) ->
+              Map.get(modoptions, "game/modoptions/ranked_game", "1") != "0"
+          end
+
+        balance_mode = params["balanceMode"]
+
+        # Balancing with parties in lobbies with large player counts can lead to OOM issues.
+        # Balancing algorithms in these conditions can generate a large number of combinations
+        # which can quickly fill up all available memory.
+        allow_groups =
+          Enum.count(player_data) <= 16 and
+            case balance_mode do
+              "skill" ->
+                false
+
+              # New mode: force party/clan balance, but only in unranked lobbies.
+              "party_unranked" ->
+                ranked? == false
+
+              # Existing behaviour: grouped mode when not explicitly skill-only
+              _ ->
+                true
+            end
+
+        force_groups = balance_mode == "party_unranked" and ranked? == false and allow_groups
+
         opts = [
-          # Balancing with parties in lobbies with large player counts can lead to OOM issues
-          # Balancing algorithmss in these conditions can generate a large number of combinations
-          # which can quickly fill up all available memory
-          allow_groups: Enum.count(player_data) <= 16 and params["balanceMode"] != "skill"
+          allow_groups: allow_groups,
+          force_groups: force_groups
         ]
 
         balance_result =

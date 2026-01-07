@@ -126,6 +126,28 @@ defmodule TeiserverWeb.API.SpadsControllerTest do
       assert data == %{}
     end
 
+    test "party_unranked mode does not crash", %{conn: conn} do
+      user = new_bot_user()
+
+      params = %{
+        "bots" => "{}",
+        # minimal valid players payload; controller will decode and then may return empty
+        "players" => "{'TestUser': {'skill': 20, 'sigma': 5, 'battleStatus': {'id': 0, 'team': 0, 'mode': 1, 'ready': 0, 'bonus': 0, 'side': 0, 'sync': 1, 'workaroundId': 0, 'workaroundTeam': 0}, 'color': {'red': 0, 'green': 0, 'blue': 0}, 'ip': None, 'port': None, 'scriptPass': '123'}}",
+        "nbTeams" => "2",
+        "balanceMode" => "party_unranked",
+        "teamSize" => "1"
+      }
+
+      conn =
+        conn
+        |> put_authorization_header(user)
+        |> get(Routes.ts_spads_path(conn, :balance_battle, params))
+
+      # In unit tests we don't spin up a lobby/balancer for this client name, so empty is expected.
+      assert response(conn, 200)
+      _ = Jason.decode!(response(conn, 200))
+    end
+
     test "can detect empty balance result" do
       # This is the default balance result when no players
       # Defined inside balance_lib.ex

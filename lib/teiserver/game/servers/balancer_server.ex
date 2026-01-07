@@ -207,22 +207,30 @@ defmodule Teiserver.Game.BalancerServer do
         v -> v
       end
 
+    # When true, grouped balancing is mandatory and we do not fall back to solo based on max deviation.
+    force_groups? = opts[:force_groups] == true
+
     if opts[:allow_groups] do
       party_result = make_grouped_balance(team_count, players, game_type, opts)
       has_parties? = Map.get(party_result, :has_parties?, true)
 
-      if has_parties? && party_result.deviation > opts[:max_deviation] do
-        make_solo_balance(
-          team_count,
-          players,
-          game_type,
-          [
-            "Tried grouped mode, got a deviation of #{party_result.deviation} and reverted to solo mode"
-          ],
-          opts
-        )
-      else
-        party_result
+      cond do
+        force_groups? ->
+          party_result
+
+        has_parties? && party_result.deviation > opts[:max_deviation] ->
+          make_solo_balance(
+            team_count,
+            players,
+            game_type,
+            [
+              "Tried grouped mode, got a deviation of #{party_result.deviation} and reverted to solo mode"
+            ],
+            opts
+          )
+
+        true ->
+          party_result
       end
     else
       make_solo_balance(team_count, players, game_type, [], opts)

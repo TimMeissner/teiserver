@@ -174,4 +174,21 @@ defmodule Teiserver.Game.BalancerServerTest do
     poll_until_nil(fn -> GenServer.call(pid, :get_current_balance) end)
     assert Map.get(GenServer.call(pid, :report_state), :last_balance_hash, :not_found) == nil
   end
+
+  test "force_groups prevents falling back to solo on max_deviation" do
+    team_count = 2
+
+    # Two parties of two players each; create ratings such that deviation will be non-zero.
+    players = make_users_with_ranks([10, 40, 20, 50])
+
+    {:ok, pid} = BalancerServer.start_link(data: %{lobby_id: 1})
+
+    result =
+      GenServer.call(
+        pid,
+        {:make_balance, team_count, [allow_groups: true, force_groups: true, max_deviation: 0], players}
+      )
+
+    assert result.balance_mode == :grouped
+  end
 end
