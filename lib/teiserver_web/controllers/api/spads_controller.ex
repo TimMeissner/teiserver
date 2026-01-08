@@ -143,14 +143,15 @@ defmodule TeiserverWeb.API.SpadsController do
         allow_groups =
           Enum.count(player_data) <= 16 and
             case balance_mode do
+              # groups are disallowed with skill only balance mode
               "skill" ->
                 false
 
-              # New mode: force party/clan balance, but only in unranked lobbies.
+              # force party/clan balance, but only in unranked lobbies.
               "party_unranked" ->
                 ranked? == false
 
-              # Existing behaviour: grouped mode when not explicitly skill-only
+              # grouped mode is allowed by default
               _ ->
                 true
             end
