@@ -84,6 +84,16 @@ defmodule TeiserverWeb.Tachyon.LobbyTest do
         Tachyon.join_ally_team!(ctx2[:client], "000")
     end
 
+    test "can join ally team", %{lobby_id: lobby_id} do
+      {:ok, ctx2} = Tachyon.setup_client()
+      %{"status" => "success"} = Tachyon.join_lobby!(ctx2[:client], lobby_id)
+
+      %{"status" => "success"} = Tachyon.join_ally_team!(ctx2[:client], "001")
+      %{"commandId" => "lobby/updated", "data" => data} = Tachyon.recv_message!(ctx2[:client])
+      player_data = data["players"][to_string(ctx2[:user].id)]
+      assert %{"isReady" => false, "assetStatus" => "ready"} = player_data
+    end
+
     test "members get updated events on join", %{client: client, lobby_id: lobby_id} do
       {:ok, ctx2} = Tachyon.setup_client()
       %{"status" => "success", "data" => _details} = Tachyon.join_lobby!(ctx2[:client], lobby_id)
@@ -189,8 +199,7 @@ defmodule TeiserverWeb.Tachyon.LobbyTest do
       [%{"userId" => ^uid2}] = start_req["data"]["spectators"]
 
       start_req_response = %{
-        # credo:disable-for-next-line Credo.Check.Readability.LargeNumbers
-        port: 32781,
+        port: 32_781,
         ips: ["127.0.0.1"]
       }
 
@@ -409,6 +418,25 @@ defmodule TeiserverWeb.Tachyon.LobbyTest do
     end
   end
 
+  describe "update client status" do
+    setup [:setup_lobby]
+
+    test "must be in lobby" do
+      {:ok, ctx2} = Tachyon.setup_client()
+
+      %{"status" => "failed", "reason" => "invalid_request"} =
+        Tachyon.lobby_update_client_status(ctx2[:client], %{"isReady" => true})
+    end
+
+    test "can update status", ctx do
+      %{"status" => "success"} =
+        Tachyon.lobby_update_client_status(ctx.client, %{"isReady" => true})
+
+      %{"commandId" => "lobby/updated", "data" => data} = Tachyon.recv_message!(ctx.client)
+      assert data["players"][to_string(ctx.user.id)]["isReady"] == true
+    end
+  end
+
   describe "listing" do
     setup [
       {Tachyon, :setup_app},
@@ -593,6 +621,33 @@ defmodule TeiserverWeb.Tachyon.LobbyTest do
 
       %{"commandId" => "lobby/listUpdated"} = Tachyon.recv_message!(client)
       {:error, :timeout} = Tachyon.recv_message(client)
+    end
+  end
+
+  describe "lobby restoration" do
+    setup [{Tachyon, :setup_client}]
+
+    test "can create lobby", %{client: client, token: token} do
+      Teiserver.Tachyon.enable_state_restoration()
+
+      lobby_data = %{
+        name: "test lobby",
+        map_name: "test-map",
+        ally_team_config: Tachyon.mk_ally_team_config(2, 1)
+      }
+
+      %{"status" => "success", "data" => data} = Tachyon.create_lobby!(client, lobby_data)
+      lobby_id = data["id"]
+      Teiserver.Tachyon.restart_system()
+      assert {:error, :disconnected} == Tachyon.recv_message(client)
+
+      client = Tachyon.connect(token, swallow_first_event: false)
+      {:ok, %{"commandId" => "user/self", "data" => data}} = Tachyon.recv_message(client)
+      assert data["user"]["currentLobby"] == lobby_id
+
+      # make sure the session correctly monitors the lobby
+      Teiserver.TachyonLobby.lookup(lobby_id) |> Process.exit(:kill)
+      %{"commandId" => "lobby/left"} = Tachyon.recv_message!(client)
     end
   end
 

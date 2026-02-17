@@ -1,11 +1,12 @@
 defmodule Teiserver.Support.Tachyon do
   alias WebsocketSyncClient, as: WSC
   alias Teiserver.OAuthFixtures
+  alias Teiserver.Support.Polling
 
   def tachyon_case_setup(tags) do
     if String.contains?(to_string(tags[:module]), "Tachyon") || tags[:tachyon] do
-      :ok = Supervisor.terminate_child(Teiserver.Supervisor, Teiserver.Tachyon.System)
-      {:ok, _pid} = Supervisor.restart_child(Teiserver.Supervisor, Teiserver.Tachyon.System)
+      Teiserver.Tachyon.disable_state_restoration()
+      Teiserver.Tachyon.restart_system()
 
       # this reduces the noise when processes attempt to do sql when the test
       # and the sandbox with it are already wound down
@@ -155,6 +156,13 @@ defmodule Teiserver.Support.Tachyon do
       request = recv_message!(client)
 
     :ok = send_response(client, request, data: %{})
+
+    Polling.poll_until_true(fn ->
+      case Teiserver.Autohost.lookup_autohost(token.bot_id) do
+        nil -> false
+        {_, val} -> val.max_battles == max_battles && val.current_battles == current
+      end
+    end)
 
     client
   end
@@ -606,6 +614,12 @@ defmodule Teiserver.Support.Tachyon do
 
   def lobby_update!(client, update_data) do
     :ok = send_request(client, "lobby/update", update_data)
+    {:ok, resp} = recv_message(client)
+    resp
+  end
+
+  def lobby_update_client_status(client, update_data) do
+    :ok = send_request(client, "lobby/updateClientStatus", update_data)
     {:ok, resp} = recv_message(client)
     resp
   end

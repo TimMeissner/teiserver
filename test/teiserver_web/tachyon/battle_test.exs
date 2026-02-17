@@ -1,4 +1,5 @@
 defmodule TeiserverWeb.Tachyon.BattleTest do
+  alias Teiserver.BotFixtures
   use TeiserverWeb.ConnCase
   alias Teiserver.Support.{Polling, Tachyon}
   alias Teiserver.OAuthFixtures
@@ -28,7 +29,8 @@ defmodule TeiserverWeb.Tachyon.BattleTest do
                battle_id: "whatever",
                match_id: 123,
                autohost_id: autohost.id,
-               autohost_timeout: 1
+               autohost_timeout: 1,
+               start_script: BotFixtures.start_script()
              })
 
     Tachyon.disconnect!(autohost_client)
@@ -39,14 +41,28 @@ defmodule TeiserverWeb.Tachyon.BattleTest do
   test "stop battle", %{autohost: autohost, autohost_client: autohost_client} do
     Polling.poll_until_some(&Teiserver.Autohost.find_autohost/0)
     battle_id = "whatever"
+    start_script = BotFixtures.start_script()
 
     assert {:ok, _pid} =
              TachyonBattle.Battle.start(%{
                battle_id: battle_id,
                match_id: 123,
                autohost_id: autohost.id,
-               autohost_timeout: 1
+               autohost_timeout: 1,
+               start_script: start_script
              })
+
+    pid = self()
+
+    start_task =
+      Task.async(fn ->
+        Teiserver.Autohost.start_battle(autohost.id, battle_id, pid, start_script)
+      end)
+
+    %{"commandId" => "autohost/start"} = req = Tachyon.recv_message!(autohost_client)
+    Tachyon.send_response(autohost_client, req, data: %{ips: ["1.2.3.4"], port: 1234})
+
+    {:ok, _} = Task.await(start_task)
 
     ev = %{
       battleId: battle_id,

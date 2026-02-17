@@ -5,15 +5,14 @@ defmodule Teiserver.TachyonLobby.Lobby do
 
   require Logger
 
-  # lobby process holds transient state about a specific lobby. If this process
-  # goes down, there is no point restarting since the state will be lost
-  use GenServer, restart: :temporary
+  @behaviour :gen_statem
 
   alias Teiserver.Asset
   alias Teiserver.Autohost
   alias Teiserver.Data.Types, as: T
   alias Teiserver.Helpers.MonitorCollection, as: MC
   alias Teiserver.Player
+  alias Teiserver.Tachyon
   alias Teiserver.TachyonBattle
   alias Teiserver.TachyonLobby
 
@@ -66,6 +65,8 @@ defmodule Teiserver.TachyonLobby.Lobby do
   @type team ::
           {allyTeam :: non_neg_integer(), team :: non_neg_integer(), player :: non_neg_integer()}
 
+  @type asset_status :: :missing | :downloading | :ready
+
   @typedoc """
   The public state of the lobby. Anything that clients need to know about
   when in a lobby should be exposed in the details object
@@ -78,7 +79,7 @@ defmodule Teiserver.TachyonLobby.Lobby do
           engine_version: String.t(),
           ally_team_config: ally_team_config(),
           players: %{
-            T.userid() => %{team: team()}
+            T.userid() => %{team: team(), ready?: boolean(), asset_status: asset_status()}
           },
           spectators: %{
             join_queue_position: number() | nil
@@ -122,7 +123,9 @@ defmodule Teiserver.TachyonLobby.Lobby do
            # player so they can join the battle
            password: String.t(),
            pid: pid(),
-           team: team()
+           team: team(),
+           ready?: boolean(),
+           asset_status: asset_status()
          }
 
   @typep spectator :: %{
@@ -162,17 +165,22 @@ defmodule Teiserver.TachyonLobby.Lobby do
              | %{
                  id: Teiserver.TachyonBattle.id(),
                  started_at: DateTime.t()
-               }
+               },
+           ids_to_rejoin: MapSet.t(T.userid())
          }
 
-  # the list of events used by the various internal functions
-  # a player (user or bot) changes team
+  # the list of internal events used to manipulate the lobby data, but also
+  # for updates to broadcast to members
+  # for more info on specific events, check how they are handled by `process_event/2`
   @typep event ::
            {:move_player, player_id(), team()}
            | {:remove_player_from_lobby, player_id()}
            | {:remove_spec_from_lobby, T.userid()}
            | {:move_spec_to_player, T.userid(), player_data :: map()}
            | {:move_player_to_spec, T.userid(), spec_data :: map()}
+           | :repack_players
+           | :fill_from_join_queue
+           | {:update_client_status, T.userid(), client_status :: map()}
            | {:update_lobby_name, new_name :: String.t()}
            | {:update_map_name, new_name :: String.t()}
            | {:update_ally_team_config, old_config :: ally_team_config(),
@@ -181,6 +189,8 @@ defmodule Teiserver.TachyonLobby.Lobby do
   @spec gen_id() :: id()
   def gen_id(), do: UUID.uuid4()
 
+  @default_call_timeout 5000
+
   # note: this uses a pid and not a lobby id because it's (currently) only
   # used by the lobby list process to bootstrap its state, and at that time
   # it has the pid (from the registry).
@@ -188,34 +198,42 @@ defmodule Teiserver.TachyonLobby.Lobby do
   # and the usual via_tuple mechanism
   @spec get_overview(pid()) :: TachyonLobby.List.overview() | nil
   def get_overview(lobby_pid) do
-    GenServer.call(lobby_pid, :get_overview)
+    :gen_statem.call(lobby_pid, :get_overview, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> nil
   end
 
   @spec get_details(id()) :: {:ok, details()} | {:error, reason :: term()}
   def get_details(id) do
-    GenServer.call(via_tuple(id), :get_details)
+    :gen_statem.call(via_tuple(id), :get_details, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
 
+  def child_spec({lobby_id, _} = args) do
+    %{
+      id: via_tuple(lobby_id),
+      start: {__MODULE__, :start_link, [args]},
+      restart: :temporary
+    }
+  end
+
   @spec start_link({id(), start_params()}) :: GenServer.on_start()
   def start_link({id, _start_params} = args) do
-    GenServer.start_link(__MODULE__, args, name: via_tuple(id))
+    :gen_statem.start_link(via_tuple(id), __MODULE__, args, [])
   end
 
   @spec join(id(), player_join_data(), pid()) ::
           {:ok, lobby_pid :: pid(), details()} | {:error, reason :: term()}
   def join(lobby_id, join_data, pid \\ self()) do
-    GenServer.call(via_tuple(lobby_id), {:join, join_data, pid})
+    :gen_statem.call(via_tuple(lobby_id), {:join, join_data, pid}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
 
   @spec leave(id(), T.userid()) :: :ok | {:error, reason :: :lobby_full | term()}
   def leave(lobby_id, user_id) do
-    GenServer.call(via_tuple(lobby_id), {:leave, user_id})
+    :gen_statem.call(via_tuple(lobby_id), {:leave, user_id}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
@@ -225,14 +243,38 @@ defmodule Teiserver.TachyonLobby.Lobby do
           | {:error,
              reason :: :invalid_lobby | :not_in_lobby | :invalid_ally_team | :ally_team_full}
   def join_ally_team(lobby_id, user_id, ally_team) do
-    GenServer.call(via_tuple(lobby_id), {:join_ally_team, user_id, ally_team})
+    :gen_statem.call(
+      via_tuple(lobby_id),
+      {:join_ally_team, user_id, ally_team},
+      @default_call_timeout
+    )
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
 
   @spec spectate(id(), T.userid()) :: :ok | {:error, :invalid_lobby | :not_in_lobby}
   def spectate(lobby_id, user_id) do
-    GenServer.call(via_tuple(lobby_id), {:spectate, user_id})
+    :gen_statem.call(via_tuple(lobby_id), {:spectate, user_id}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _} -> {:error, :invalid_lobby}
+  end
+
+  @spec rejoin(id(), T.userid(), pid()) ::
+          {:ok, lobby_pid :: pid(), details()} | {:error, :invalid_lobby}
+  def rejoin(lobby_id, user_id, pid) do
+    :gen_statem.call(via_tuple(lobby_id), {:rejoin, user_id, pid}, @default_call_timeout)
+  catch
+    :exit, {:noproc, _} -> {:error, :invalid_lobby}
+  end
+
+  @type client_status_update_data :: %{
+          optional(:ready?) => boolean(),
+          optional(:asset_status) => asset_status()
+        }
+  @spec update_client_status(id(), T.userid(), client_status_update_data()) ::
+          :ok | {:error, :invalid_lobby | :not_in_lobby | :not_a_player}
+  def update_client_status(lobby_id, user_id, update_data) do
+    :gen_statem.call(via_tuple(lobby_id), {:update_client_status, user_id, update_data})
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
@@ -255,7 +297,7 @@ defmodule Teiserver.TachyonLobby.Lobby do
         short_name,
         opts \\ []
       ) do
-    GenServer.call(
+    :gen_statem.call(
       via_tuple(lobby_id),
       {:add_bot, user_id,
        %{
@@ -264,7 +306,8 @@ defmodule Teiserver.TachyonLobby.Lobby do
          name: opts[:name],
          version: opts[:version],
          options: Keyword.get(opts, :options, %{})
-       }}
+       }},
+      @default_call_timeout
     )
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
@@ -272,14 +315,14 @@ defmodule Teiserver.TachyonLobby.Lobby do
 
   @spec remove_bot(id(), bot_id :: String.t()) :: :ok | {:error, :invalid_bot_id | term()}
   def remove_bot(lobby_id, bot_id) do
-    GenServer.call(via_tuple(lobby_id), {:remove_bot, bot_id})
+    :gen_statem.call(via_tuple(lobby_id), {:remove_bot, bot_id}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
 
   @spec update_bot(id(), bot_update_data()) :: :ok | {:error, reason :: :invalid_bot_id | term()}
   def update_bot(lobby_id, update_data) do
-    GenServer.call(via_tuple(lobby_id), {:update_bot, update_data})
+    :gen_statem.call(via_tuple(lobby_id), {:update_bot, update_data}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
@@ -296,7 +339,11 @@ defmodule Teiserver.TachyonLobby.Lobby do
   @spec update_properties(id(), T.userid(), lobby_update_data()) ::
           :ok | {:error, :invalid_lobby | term()}
   def update_properties(lobby_id, user_id, update_data) do
-    GenServer.call(via_tuple(lobby_id), {:update_properties, user_id, update_data})
+    :gen_statem.call(
+      via_tuple(lobby_id),
+      {:update_properties, user_id, update_data},
+      @default_call_timeout
+    )
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
@@ -307,12 +354,12 @@ defmodule Teiserver.TachyonLobby.Lobby do
   """
   @spec get_start_script(id()) :: Autohost.start_script()
   def get_start_script(lobby_id) do
-    GenServer.call(via_tuple(lobby_id), :get_start_script)
+    :gen_statem.call(via_tuple(lobby_id), :get_start_script, @default_call_timeout)
   end
 
   @spec join_queue(id(), T.userid()) :: :ok | {:error, :invalid_lobby | :not_in_lobby}
   def join_queue(lobby_id, user_id) do
-    GenServer.call(via_tuple(lobby_id), {:join_queue, user_id})
+    :gen_statem.call(via_tuple(lobby_id), {:join_queue, user_id}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
@@ -320,14 +367,18 @@ defmodule Teiserver.TachyonLobby.Lobby do
   @spec start_battle(id(), T.userid()) ::
           :ok | {:error, reason :: :not_in_lobby | :battle_already_started | term()}
   def start_battle(lobby_id, user_id) do
-    GenServer.call(via_tuple(lobby_id), {:start_battle, user_id})
+    :gen_statem.call(via_tuple(lobby_id), {:start_battle, user_id}, @default_call_timeout)
   catch
     :exit, {:noproc, _} -> {:error, :invalid_lobby}
   end
 
-  @impl true
-  @spec init({id(), start_params()}) :: {:ok, state()}
-  def init({id, start_params}) do
+  @impl :gen_statem
+  def callback_mode(), do: :handle_event_function
+
+  @impl :gen_statem
+  @spec init({id(), {:user, start_params()} | {:snapshot, binary()}}) :: {:ok, term(), state()}
+  def init({id, {:user, start_params}}) do
+    Process.flag(:trap_exit, true)
     Logger.metadata(actor_type: :lobby, actor_id: id)
 
     monitors =
@@ -347,31 +398,103 @@ defmodule Teiserver.TachyonLobby.Lobby do
           name: start_params.creator_data.name,
           password: gen_password(),
           pid: start_params.creator_pid,
-          team: {0, 0, 0}
+          team: {0, 0, 0},
+          ready?: false,
+          asset_status: :ready
         }
       },
       spectators: %{},
       bot_idx_counter: 0,
-      current_battle: nil
+      current_battle: nil,
+      ids_to_rejoin: MapSet.new()
     }
 
     TachyonLobby.List.register_lobby(self(), id, get_overview_from_state(state))
     Logger.info("Lobby created by user #{start_params.creator_data.id}")
-    {:ok, state}
+    {:ok, :running, state}
   end
 
-  @impl true
-  def handle_call(:get_details, _from, state) do
-    {:reply, {:ok, get_details_from_state(state)}, state}
+  def init({id, {:snapshot, serialized_data}}) do
+    Process.flag(:trap_exit, true)
+    Logger.metadata(actor_type: :lobby, actor_id: id)
+    Logger.debug("Restoring lobby from snapshot")
+
+    snapshot = :erlang.binary_to_term(serialized_data)
+
+    player_ids =
+      for {id, x} <- snapshot.players, !is_map_key(x, :host_user_id) do
+        id
+      end
+
+    ids_to_rejoin = MapSet.new(Enum.concat(player_ids, Map.keys(snapshot.spectators)))
+
+    data =
+      snapshot
+      |> Map.put(:monitors, MC.new())
+      |> Map.put(:ids_to_rejoin, ids_to_rejoin)
+
+    timeout = Tachyon.get_restoration_timeout()
+    actions = [{:state_timeout, timeout, :snapshot_timeout}]
+
+    {:ok, :starting_up, data, actions}
   end
 
-  def handle_call(:get_overview, _from, state) do
-    {:reply, get_overview_from_state(state), state}
+  @impl :gen_statem
+  def handle_event({:call, from}, :get_details, _state, data) do
+    {:keep_state, data, [{:reply, from, {:ok, get_details_from_state(data)}}]}
   end
 
-  def handle_call({:join, join_data, _pid}, _from, state)
-      when is_map_key(state.players, join_data.id) or is_map_key(state.spectators, join_data.id) do
-    {:reply, {:ok, self(), get_details_from_state(state)}, state}
+  def handle_event({:call, from}, :get_overview, _state, data) do
+    {:keep_state, data, [{:reply, from, get_overview_from_state(data)}]}
+  end
+
+  def handle_event({:call, from}, {:rejoin, _user_id, _user_pid}, state, data)
+      when state != :starting_up,
+      do: {:keep_state, data, [{:reply, from, {:error, :invalid_lobby}}]}
+
+  def handle_event({:call, from}, {:rejoin, user_id, user_pid}, :starting_up, data) do
+    if MapSet.member?(data.ids_to_rejoin, user_id) do
+      ids_left = MapSet.delete(data.ids_to_rejoin, user_id)
+
+      players =
+        if is_map_key(data.players, user_id),
+          do: put_in(data.players, [user_id, :pid], user_pid),
+          else: data.players
+
+      spectators =
+        if is_map_key(data.spectators, user_id),
+          do: put_in(data.spectators, [user_id, :pid], user_pid),
+          else: data.spectators
+
+      data =
+        %{data | players: players, spectators: spectators, ids_to_rejoin: ids_left}
+        |> Map.update!(:monitors, &MC.monitor(&1, user_pid, {:user, user_id}))
+
+      actions = [{:reply, from, {:ok, self(), get_details_from_state(data)}}]
+
+      if MapSet.size(ids_left) == 0 do
+        Logger.debug("all member rejoined, start up completed")
+        TachyonLobby.List.register_lobby(self(), data.id, get_overview_from_state(data))
+        {:next_state, :running, data, actions}
+      else
+        {:keep_state, data, actions}
+      end
+    else
+      {:keep_state, data, [{:reply, from, {:error, :invalid_lobby}}]}
+    end
+  end
+
+  def handle_event({:call, _from}, _, :starting_up, data) do
+    {:keep_state, data, [{:postpone, true}]}
+  end
+
+  def handle_event({:call, from}, _, :shutting_down, data) do
+    {:keep_state, data, [{:reply, from, {:error, :shutting_down}}]}
+  end
+
+  def handle_event({:call, from}, {:join, join_data, _pid}, _state, data)
+      when is_map_key(data.players, join_data.id) or is_map_key(data.spectators, join_data.id) do
+    {:keep_state, data, [{:reply, from, {:ok, self(), get_details_from_state(data)}}]}
   end
 
   # 251 is the (current) engine limit for specs + players + bots
@@ -380,16 +503,16 @@ defmodule Teiserver.TachyonLobby.Lobby do
   # lobby members, but it would be rather awkward to only have a subset
   # then in the battle. It's overall simpler to also limit the lobby size
   # (though the members of the lobby may not be the one in the battle itself)
-  def handle_call({:join, _join_data, _pid}, _from, state)
-      when map_size(state.spectators) + map_size(state.players) >= 251 do
-    {:reply, {:error, :lobby_full}, state}
+  def handle_event({:call, from}, {:join, _join_data, _pid}, _state, data)
+      when map_size(data.spectators) + map_size(data.players) >= 251 do
+    {:keep_state, data, [{:reply, from, {:error, :lobby_full}}]}
   end
 
-  def handle_call({:join, join_data, pid}, _from, state) do
+  def handle_event({:call, from}, {:join, join_data, pid}, _state, data) do
     user_id = join_data.id
 
-    state =
-      put_in(state, [:spectators, user_id], %{
+    data =
+      put_in(data, [:spectators, user_id], %{
         id: user_id,
         name: join_data.name,
         password: gen_password(),
@@ -399,143 +522,155 @@ defmodule Teiserver.TachyonLobby.Lobby do
       |> Map.update!(:monitors, &MC.monitor(&1, pid, {:user, user_id}))
 
     update = %{join_queue_position: nil}
-    broadcast_update({:update, user_id, %{spectators: %{user_id => update}}}, state)
+    broadcast_update({:update, user_id, %{spectators: %{user_id => update}}}, data)
 
-    {:reply, {:ok, self(), get_details_from_state(state)}, state}
+    {:keep_state, data, [{:reply, from, {:ok, self(), get_details_from_state(data)}}]}
   end
 
-  def handle_call({:leave, user_id}, _from, state) when is_map_key(state.players, user_id) do
-    case remove_player_from_lobby(user_id, state) do
-      state when map_size(state.players) > 0 or map_size(state.spectators) > 0 ->
-        {:reply, :ok, state}
+  def handle_event({:call, from}, {:leave, user_id}, _state, data)
+      when is_map_key(data.players, user_id) do
+    case remove_player_from_lobby(user_id, data) do
+      data when map_size(data.players) > 0 or map_size(data.spectators) > 0 ->
+        {:keep_state, data, [{:reply, from, :ok}]}
 
-      state ->
-        {:reply, :ok, state, {:continue, :empty}}
+      data ->
+        {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :empty}]}
     end
   end
 
-  def handle_call({:leave, user_id}, _from, state) when is_map_key(state.spectators, user_id) do
-    state = remove_spectator_from_lobby(user_id, state)
+  def handle_event({:call, from}, {:leave, user_id}, _state, data)
+      when is_map_key(data.spectators, user_id) do
+    data = remove_spectator_from_lobby(user_id, data)
 
-    if map_size(state.players) > 0 or map_size(state.spectators) > 0 do
-      {:reply, :ok, state}
+    if map_size(data.players) > 0 or map_size(data.spectators) > 0 do
+      {:keep_state, data, [{:reply, from, :ok}]}
     else
-      {:reply, :ok, state, {:continue, :empty}}
+      {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :empty}]}
     end
   end
 
-  def handle_call({:leave, _user_id}, _from, state), do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:leave, _user_id}, _state, data),
+    do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:join_ally_team, user_id, _ally_team}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:join_ally_team, user_id, _ally_team}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:join_ally_team, user_id, _ally_team}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:join_ally_team, user_id, _ally_team}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:join_ally_team, _user_id, ally_team}, _from, state)
-      when ally_team >= length(state.ally_team_config) or ally_team < 0,
-      do: {:reply, {:error, :invalid_ally_team}, state}
+  def handle_event({:call, from}, {:join_ally_team, _user_id, ally_team}, _state, data)
+      when ally_team >= length(data.ally_team_config) or ally_team < 0,
+      do: {:keep_state, data, [{:reply, from, {:error, :invalid_ally_team}}]}
 
-  def handle_call({:join_ally_team, user_id, ally_team}, _from, state) do
-    ally_team_capacity = Enum.at(state.ally_team_config, ally_team).max_teams
+  def handle_event({:call, from}, {:join_ally_team, user_id, ally_team}, _state, data) do
+    ally_team_capacity = Enum.at(data.ally_team_config, ally_team).max_teams
 
-    in_team_count = team_count(ally_team, state.players)
+    in_team_count = team_count(ally_team, data.players)
 
     already_there? =
-      case state.players[user_id] do
+      case data.players[user_id] do
         nil -> false
         %{team: {at, _, _}} -> at == ally_team
       end
 
     cond do
       already_there? ->
-        {:reply, {:ok, get_details_from_state(state)}, state}
+        {:keep_state, data, [{:reply, from, {:ok, get_details_from_state(data)}}]}
 
       in_team_count >= ally_team_capacity ->
-        {:reply, {:error, :ally_team_full}, state}
+        {:keep_state, data, [{:reply, from, {:error, :ally_team_full}}]}
 
       true ->
         # we guarantee that teams are consecutive in the ally team (without gap)
         # so we can use the in_team_count as the index for the new team in the ally team
         team = {ally_team, in_team_count, 0}
 
-        case {is_map_key(state.players, user_id), state.spectators[user_id]} do
+        case {is_map_key(data.players, user_id), data.spectators[user_id]} do
           {true, nil} ->
             # we're moving a player from a different ally team
-            remove_events = do_remove_player(user_id, state.players)
-            events = [{:move_player, user_id, team} | remove_events]
+            events = [{:move_player, user_id, team}, :repack_players]
+            data = process_events(events, data) |> broadcast_updates() |> Map.get(:data)
 
-            state = new_state_from_events(events, state)
-            broadcast_updates(events, state)
-
-            {:reply, {:ok, get_details_from_state(state)}, state}
+            {:keep_state, data, [{:reply, from, {:ok, get_details_from_state(data)}}]}
 
           {false, _s} ->
             # Adding a spec into an ally team. The way we construct the team
             # means it doesn't require any reshuffling of existing players
             events = [{:move_spec_to_player, user_id, %{team: team}}]
-            state = new_state_from_events(events, state)
-            broadcast_updates(events, state)
-            broadcast_player_count_change(state)
+            data = process_events(events, data) |> broadcast_updates() |> Map.get(:data)
+            broadcast_player_count_change(data)
 
-            {:reply, {:ok, get_details_from_state(state)}, state}
+            {:keep_state, data, [{:reply, from, {:ok, get_details_from_state(data)}}]}
         end
     end
   end
 
-  def handle_call({:spectate, user_id}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:spectate, user_id}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:spectate, user_id}, _from, state)
-      when is_map_key(state.spectators, user_id) do
-    if state.spectators[user_id].join_queue_position == nil do
-      {:reply, :ok, state}
+  def handle_event({:call, from}, {:spectate, user_id}, _state, data)
+      when is_map_key(data.spectators, user_id) do
+    if data.spectators[user_id].join_queue_position == nil do
+      {:keep_state, data, [{:reply, from, :ok}]}
     else
-      state = put_in(state.spectators[user_id].join_queue_position, nil)
+      data = put_in(data.spectators[user_id].join_queue_position, nil)
       update = %{spectators: %{user_id => %{join_queue_position: nil}}}
-      broadcast_update({:update, nil, update}, state)
-      {:reply, :ok, state}
+      broadcast_update({:update, nil, update}, data)
+      {:keep_state, data, [{:reply, from, :ok}]}
     end
   end
 
-  def handle_call({:spectate, user_id}, _from, state) when is_map_key(state.players, user_id) do
-    remove_events = do_remove_player(user_id, state.players)
+  def handle_event({:call, from}, {:spectate, user_id}, _state, data)
+      when is_map_key(data.players, user_id) do
+    events = [
+      {:move_player_to_spec, user_id, %{join_queue_position: nil}},
+      :repack_players,
+      :fill_from_join_queue
+    ]
 
-    events = [{:move_player_to_spec, user_id, %{join_queue_position: nil}} | remove_events]
-    state = new_state_from_events(events, state)
+    data = process_events(events, data) |> broadcast_updates() |> Map.get(:data)
 
-    {events, state} =
-      case add_player_from_join_queue(state) do
-        nil -> {events, state}
-        ev -> {[ev | events], new_state_from_events([ev], state)}
-      end
-
-    broadcast_updates(events, state)
-
-    {:reply, :ok, state}
+    {:keep_state, data, [{:reply, from, :ok}]}
   end
 
-  def handle_call({:add_bot, user_id, _add_data}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:update_client_status, user_id, _}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:add_bot, _user_id, add_data}, _from, state)
-      when add_data.ally_team >= length(state.ally_team_config) or add_data.ally_team < 0,
-      do: {:reply, {:error, :invalid_ally_team}, state}
+  # maybe we'll want to keep track of client status when they move from player
+  # to spec, but for now, just reject the request for non players.
+  def handle_event({:call, from}, {:update_client_status, user_id, _}, _state, data)
+      when is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_a_player}}]}
 
-  def handle_call({:add_bot, user_id, add_data}, _from, state) do
+  def handle_event({:call, from}, {:update_client_status, user_id, update_data}, _state, data) do
+    supported_properties = [:ready?, :asset_status]
+    event = {:update_client_status, user_id, Map.take(update_data, supported_properties)}
+    data = process_events([event], data) |> broadcast_updates() |> Map.get(:data)
+    {:keep_state, data, [{:reply, from, :ok}]}
+  end
+
+  def handle_event({:call, from}, {:add_bot, user_id, _add_data}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
+
+  def handle_event({:call, from}, {:add_bot, _user_id, add_data}, _state, data)
+      when add_data.ally_team >= length(data.ally_team_config) or add_data.ally_team < 0,
+      do: {:keep_state, data, [{:reply, from, {:error, :invalid_ally_team}}]}
+
+  def handle_event({:call, from}, {:add_bot, user_id, add_data}, _state, data) do
     ally_team = add_data.ally_team
-    ally_team_capacity = Enum.at(state.ally_team_config, ally_team).max_teams
+    ally_team_capacity = Enum.at(data.ally_team_config, ally_team).max_teams
 
-    in_team_count = team_count(ally_team, state.players)
+    in_team_count = team_count(ally_team, data.players)
 
     if in_team_count >= ally_team_capacity do
-      {:reply, {:error, :ally_team_full}, state}
+      {:keep_state, data, [{:reply, from, {:error, :ally_team_full}}]}
     else
-      bot_id = "bot-#{state.bot_idx_counter}"
+      bot_id = "bot-#{data.bot_idx_counter}"
 
       bot = %{
         id: bot_id,
@@ -547,224 +682,257 @@ defmodule Teiserver.TachyonLobby.Lobby do
         options: add_data.options
       }
 
-      state =
-        put_in(state.players[bot.id], bot)
+      data =
+        put_in(data.players[bot.id], bot)
         |> Map.update!(:bot_idx_counter, &(&1 + 1))
 
-      broadcast_update({:update, nil, %{players: %{bot.id => bot}}}, state)
+      broadcast_update({:update, nil, %{players: %{bot.id => bot}}}, data)
 
-      {:reply, {:ok, bot.id}, state}
+      {:keep_state, data, [{:reply, from, {:ok, bot.id}}]}
     end
   end
 
-  def handle_call({:remove_bot, bot_id}, _from, state) when not is_map_key(state.players, bot_id),
-    do: {:reply, {:error, :invalid_bot_id}, state}
+  def handle_event({:call, from}, {:remove_bot, bot_id}, _state, data)
+      when not is_map_key(data.players, bot_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :invalid_bot_id}}]}
 
-  def handle_call({:remove_bot, bot_id}, _from, state) do
-    events = do_remove_player(bot_id, state.players)
-    events = [{:remove_player_from_lobby, bot_id} | events]
-    state = new_state_from_events(events, state)
+  def handle_event({:call, from}, {:remove_bot, bot_id}, _state, data) do
+    events = [{:remove_player_from_lobby, bot_id}, :repack_players, :fill_from_join_queue]
+    aggregate = process_events(events, data) |> broadcast_updates()
 
-    {events, state} =
-      case add_player_from_join_queue(state) do
-        nil -> {events, state}
-        ev -> {[ev | events], new_state_from_events([ev], state)}
-      end
-
-    broadcast_updates(events, state)
-
-    {:reply, :ok, state}
+    {:keep_state, aggregate.data, [{:reply, from, :ok}]}
   end
 
-  def handle_call({:update_bot, %{id: bot_id}}, _from, state)
-      when not is_map_key(state.players, bot_id),
-      do: {:reply, {:error, :invalid_bot_id}, state}
+  def handle_event({:call, from}, {:update_bot, %{id: bot_id}}, _state, data)
+      when not is_map_key(data.players, bot_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :invalid_bot_id}}]}
 
-  def handle_call({:update_bot, %{id: bot_id} = update_data}, _from, state) do
-    patch_merge(state.players[bot_id], update_data)
-    state = update_in(state.players[bot_id], &patch_merge(&1, update_data))
-    broadcast_update({:update, nil, %{players: %{bot_id => update_data}}}, state)
-    {:reply, :ok, state}
+  def handle_event({:call, from}, {:update_bot, %{id: bot_id} = update_data}, _state, data) do
+    patch_merge(data.players[bot_id], update_data)
+    data = update_in(data.players[bot_id], &patch_merge(&1, update_data))
+    broadcast_update({:update, nil, %{players: %{bot_id => update_data}}}, data)
+    {:keep_state, data, [{:reply, from, :ok}]}
   end
 
-  def handle_call({:update_properties, _, data}, _from, state) when map_size(data) == 0,
-    do: {:reply, :ok, state}
+  def handle_event({:call, from}, {:update_properties, _, data}, _state, fsm_data)
+      when map_size(data) == 0,
+      do: {:keep_state, fsm_data, [{:reply, from, :ok}]}
 
-  def handle_call({:update_properties, _user_id, data}, _from, state) do
-    {final_state, events, errors} =
-      Enum.reduce(data, {state, [], []}, fn {k, v}, {state, events, errors} ->
-        case update_property(k, v, state) do
+  def handle_event({:call, from}, {:update_properties, user_id, data}, _state, fsm_data) do
+    {events, errors} =
+      Enum.reduce(data, {[], []}, fn {k, v}, {events, errors} ->
+        case update_property(k, v, fsm_data, user_id) do
           {:error, msg} ->
-            {state, events, [msg | errors]}
+            {events, [msg | errors]}
 
           {:ok, new_events} ->
-            updated_state = new_state_from_events(new_events, state)
-            {updated_state, events ++ new_events, errors}
+            {events ++ new_events, errors}
         end
       end)
 
     if Enum.empty?(errors) do
-      broadcast_updates(events, final_state)
-      broadcast_list_updates(events, state, final_state)
-      {:reply, :ok, final_state}
+      final_data = process_events(events, fsm_data) |> broadcast_updates() |> Map.get(:data)
+      broadcast_list_updates(events, fsm_data, final_data)
+      {:keep_state, final_data, [{:reply, from, :ok}]}
     else
       message = Enum.join(errors, ", ")
-      {:reply, {:error, "Cannot update lobby: #{message}"}, state}
+      {:keep_state, fsm_data, [{:reply, from, {:error, "Cannot update lobby: #{message}"}}]}
     end
   end
 
-  def handle_call({:join_queue, user_id}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:join_queue, user_id}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:join_queue, user_id}, _from, state) do
+  def handle_event({:call, from}, {:join_queue, user_id}, _state, data) do
     cond do
       # already in the join queue, do nothing. This avoid someone
       # losing their position if they fat-finger the button
-      get_in(state.spectators[user_id].join_queue_position) != nil ->
-        {:reply, :ok, state}
+      get_in(data.spectators[user_id].join_queue_position) != nil ->
+        {:keep_state, data, [{:reply, from, :ok}]}
 
       # there is no one in the join queue. So going into the join queue will immediately put
       # the player back into an ally team. Although they may end up in a different ally team
       # it is largely useless, so for simplicity sake, ignore the join_queue command
-      is_map_key(state.players, user_id) and
-          Enum.all?(state.spectators, fn {_, s} -> s.join_queue_position == nil end) ->
-        {:reply, :ok, state}
+      is_map_key(data.players, user_id) and
+          Enum.all?(data.spectators, fn {_, s} -> s.join_queue_position == nil end) ->
+        {:keep_state, data, [{:reply, from, :ok}]}
 
       # swap the player with the first in the join queue
-      is_map_key(state.players, user_id) ->
-        s_id = get_first_player_in_join_queue(state.spectators)
-        player = state.players[user_id]
-        pos = find_spec_queue_pos(state.spectators)
+      is_map_key(data.players, user_id) ->
+        s_id = get_first_player_in_join_queue(data.spectators)
+        player = data.players[user_id]
+        pos = find_spec_queue_pos(data.spectators)
 
         events = [
           {:move_spec_to_player, s_id, %{team: player.team}},
           {:move_player_to_spec, user_id, %{join_queue_position: pos}}
         ]
 
-        state = new_state_from_events(events, state)
-        broadcast_updates(events, state)
+        data = process_events(events, data) |> broadcast_updates() |> Map.get(:data)
 
-        {:reply, :ok, state}
+        {:keep_state, data, [{:reply, from, :ok}]}
 
       # spec getting into the join queue
       true ->
-        state =
-          case find_team(state.ally_team_config, state.players) do
+        data =
+          case find_team(data.ally_team_config, data.players) do
             nil ->
-              pos = find_spec_queue_pos(state.spectators)
+              pos = find_spec_queue_pos(data.spectators)
 
-              state =
-                update_in(state.spectators[user_id], fn s ->
+              data =
+                update_in(data.spectators[user_id], fn s ->
                   s |> Map.put(:join_queue_position, pos)
                 end)
 
               update = %{spectators: %{user_id => %{join_queue_position: pos}}}
-              broadcast_update({:update, nil, update}, state)
+              broadcast_update({:update, nil, update}, data)
 
             team ->
-              initial_state = state
+              initial_state = data
               events = [{:move_spec_to_player, user_id, %{team: team}}]
-              state = new_state_from_events(events, state)
-              broadcast_updates(events, state)
-              broadcast_list_updates(events, initial_state, state)
+              data = process_events(events, data) |> broadcast_updates() |> Map.get(:data)
+              broadcast_list_updates(events, initial_state, data)
           end
 
-        {:reply, :ok, state}
+        {:keep_state, data, [{:reply, from, :ok}]}
     end
   end
 
-  def handle_call({:start_battle, user_id}, _from, state)
-      when not is_map_key(state.players, user_id) and not is_map_key(state.spectators, user_id),
-      do: {:reply, {:error, :not_in_lobby}, state}
+  def handle_event({:call, from}, {:start_battle, user_id}, _state, data)
+      when not is_map_key(data.players, user_id) and not is_map_key(data.spectators, user_id),
+      do: {:keep_state, data, [{:reply, from, {:error, :not_in_lobby}}]}
 
-  def handle_call({:start_battle, _user_id}, _from, state)
-      when state.current_battle != nil,
-      do: {:reply, {:error, :battle_already_started}, state}
+  def handle_event({:call, from}, {:start_battle, _user_id}, _state, data)
+      when data.current_battle != nil,
+      do: {:keep_state, data, [{:reply, from, {:error, :battle_already_started}}]}
 
-  def handle_call({:start_battle, _user_id}, _from, state) do
+  def handle_event({:call, from}, {:start_battle, _user_id}, _state, data) do
     with autohost_id when autohost_id != nil <- Autohost.find_autohost(),
          {:ok, {battle_id, battle_pid} = battle_data, host_data} <-
            TachyonBattle.start_battle(
              autohost_id,
-             gen_start_script(state),
+             gen_start_script(data),
              false
            ) do
       start_data = %{
         ips: host_data.ips,
         port: host_data.port,
-        engine: %{version: state.engine_version},
-        game: %{springName: state.game_version},
-        map: %{springName: state.map_name}
+        engine: %{version: data.engine_version},
+        game: %{springName: data.game_version},
+        map: %{springName: data.map_name}
       }
 
-      for {p_id, p} <- Enum.concat(state.players, state.spectators),
+      for {p_id, p} <- Enum.concat(data.players, data.spectators),
           is_map_key(p, :password),
           do: Player.lobby_battle_start(p_id, battle_data, start_data, p.password)
 
       now = DateTime.utc_now()
 
-      state =
-        %{state | current_battle: %{id: battle_id, started_at: now}}
+      data =
+        %{data | current_battle: %{id: battle_id, started_at: now}}
         |> Map.update!(:monitors, &MC.monitor(&1, battle_pid, :current_battle))
 
-      broadcast_update({:update, nil, %{current_battle: state.current_battle}}, state)
-      TachyonLobby.List.update_lobby(state.id, %{current_battle: %{started_at: now}})
+      broadcast_update({:update, nil, %{current_battle: data.current_battle}}, data)
+      TachyonLobby.List.update_lobby(data.id, %{current_battle: %{started_at: now}})
 
-      {:reply, :ok, state}
+      {:keep_state, data, [{:reply, from, :ok}]}
     else
       nil ->
         Logger.warning("No autohost available to start lobby battle")
-        {:reply, {:error, :no_autohost}, state}
+        {:keep_state, data, [{:reply, from, {:error, :no_autohost}}]}
 
       {:error, reason} ->
         Logger.error("Cannot start lobby battle: #{inspect(reason)}")
-        {:reply, {:error, reason}, state}
+        {:keep_state, data, [{:reply, from, {:error, reason}}]}
     end
   end
 
-  def handle_call(:get_start_script, _from, state), do: {:reply, gen_start_script(state), state}
+  def handle_event({:call, from}, :get_start_script, _state, data),
+    do: {:keep_state, data, [{:reply, from, gen_start_script(data)}]}
 
-  @impl true
-  def handle_info({:DOWN, ref, :process, _obj, reason}, state) do
-    val = MC.get_val(state.monitors, ref)
-    state = Map.update!(state, :monitors, &MC.demonitor_by_val(&1, val))
+  def handle_event(:info, {:DOWN, ref, :process, _pid, :shutdown}, state, data) do
+    val = MC.get_val(data.monitors, ref)
+    data = Map.update!(data, :monitors, &MC.demonitor_by_val(&1, val))
 
-    state =
+    case state do
+      :shutting_down -> {:keep_state, data}
+      _ -> {:next_state, :shutting_down, data}
+    end
+  end
+
+  # only DOWN events matter when shutting down the lobby, everything else should be ignored
+  def handle_event(:info, _, :shutting_down, data) do
+    {:keep_state, data}
+  end
+
+  def handle_event(:info, {:DOWN, ref, :process, _obj, reason}, _state, data) do
+    val = MC.get_val(data.monitors, ref)
+    data = Map.update!(data, :monitors, &MC.demonitor_by_val(&1, val))
+
+    data =
       case val do
         {:user, user_id} ->
           Logger.debug("user #{user_id} disappeared from the lobby because #{inspect(reason)}")
 
           cond do
-            is_map_key(state.players, user_id) ->
-              remove_player_from_lobby(user_id, state)
+            is_map_key(data.players, user_id) ->
+              remove_player_from_lobby(user_id, data)
 
-            is_map_key(state.spectators, user_id) ->
-              remove_spectator_from_lobby(user_id, state)
+            is_map_key(data.spectators, user_id) ->
+              remove_spectator_from_lobby(user_id, data)
           end
 
         :current_battle ->
-          state = Map.put(state, :current_battle, nil)
-          broadcast_update({:update, nil, %{current_battle: nil}}, state)
-          TachyonLobby.List.update_lobby(state.id, %{current_battle: nil})
-          state
+          data = Map.put(data, :current_battle, nil)
+          broadcast_update({:update, nil, %{current_battle: nil}}, data)
+          TachyonLobby.List.update_lobby(data.id, %{current_battle: nil})
+          data
 
         nil ->
-          state
+          data
       end
 
-    if Enum.empty?(state.players) and Enum.empty?(state.spectators) do
-      {:noreply, state, {:continue, :empty}}
+    if Enum.empty?(data.players) and Enum.empty?(data.spectators) do
+      {:keep_state, data, [{:next_event, :internal, :empty}]}
     else
-      {:noreply, state}
+      {:keep_state, data}
     end
   end
 
-  @impl true
-  def handle_continue(:empty, state) do
-    Logger.info("Lobby shutting down because empty")
-    {:stop, {:shutdown, :empty}, state}
+  def handle_event(:info, {:EXIT, _pid, reason}, _state, _data) do
+    {:stop, reason}
   end
+
+  def handle_event(:internal, :empty, _state, data) do
+    Logger.info("Lobby shutting down because empty")
+    {:stop, {:shutdown, :empty}, data}
+  end
+
+  def handle_event(:state_timeout, :snapshot_timeout, :starting_up, data) do
+    Logger.warning("failed to recover before time out. Missing #{inspect(data.ids_to_rejoin)}")
+    {:stop, :normal}
+  end
+
+  @impl :gen_statem
+  def terminate(:shutdown, :shutting_down, data) do
+    if Tachyon.should_restore_state?() do
+      to_save =
+        data
+        |> Map.drop([:monitors])
+        |> Map.update!(:players, fn ps ->
+          for {k, v} <- ps, into: %{}, do: {k, Map.delete(v, :pid)}
+        end)
+        |> Map.update!(:spectators, fn ps ->
+          for {k, v} <- ps, into: %{}, do: {k, Map.delete(v, :pid)}
+        end)
+        |> :erlang.term_to_binary()
+
+      Teiserver.KvStore.put("lobby", data.id, to_save)
+    end
+  end
+
+  def terminate(_reason, _state, _data), do: nil
 
   @spec via_tuple(id()) :: GenServer.name()
   defp via_tuple(lobby_id) do
@@ -795,7 +963,7 @@ defmodule Teiserver.TachyonLobby.Lobby do
 
     players =
       Enum.map(players, fn {p_id, p} ->
-        {p_id, %{team: p.team}}
+        {p_id, Map.take(p, [:team, :ready?, :asset_status])}
       end)
       |> Enum.into(%{})
 
@@ -819,76 +987,221 @@ defmodule Teiserver.TachyonLobby.Lobby do
     |> Map.put(:bots, Map.new(bots))
   end
 
-  @spec new_state_from_events([event()], state()) :: state()
-  defp new_state_from_events(events, state),
-    do: Enum.reduce(events, state, &new_state_from_event/2)
+  # Given a list of events to process (in the event sourcing way) and the initial
+  # state to apply these events to, returns the final state alongside any
+  # potential update events that should also be broadcasted to members
+  @typep aggregate :: %{data: state(), updates: [event()]}
+  @spec process_events([event()], state()) :: aggregate()
+  defp process_events(events, state),
+    do: Enum.reduce(events, %{data: state, updates: []}, &process_event/2)
 
-  @spec new_state_from_event(event(), state()) :: state()
-  defp new_state_from_event({:move_player, p_id, team}, state),
-    do: put_in(state.players[p_id].team, team)
-
-  defp new_state_from_event({:remove_player_from_lobby, p_id}, state) do
-    state
-    |> Map.update!(:players, &Map.delete(&1, p_id))
-    |> Map.update!(:monitors, &MC.demonitor_by_val(&1, {:user, p_id}))
+  @spec process_event(event(), %{data: state(), updates: [event()]}) :: %{
+          data: state(),
+          updates: [event()]
+        }
+  defp process_event({:move_player, p_id, team} = ev, aggregate) do
+    aggregate
+    |> update_in([:data, :players, p_id], fn p ->
+      Map.merge(p, %{team: team, ready?: false, asset_status: :ready})
+    end)
+    |> update_in([:updates], &[ev | &1])
   end
 
-  defp new_state_from_event({:remove_spec_from_lobby, s_id}, state) do
-    state
-    |> Map.update!(:spectators, &Map.delete(&1, s_id))
-    |> Map.update!(:monitors, &MC.demonitor_by_val(&1, {:user, s_id}))
+  defp process_event({:remove_player_from_lobby, p_id} = ev, aggregate) do
+    aggregate
+    |> update_in([:data, :players], &Map.delete(&1, p_id))
+    |> update_in([:data, :monitors], &MC.demonitor_by_val(&1, {:user, p_id}))
+    |> update_in([:updates], &[ev | &1])
   end
 
-  defp new_state_from_event({:move_spec_to_player, p_id, player_data}, state) do
+  defp process_event({:remove_spec_from_lobby, s_id} = ev, aggregate) do
+    aggregate
+    |> update_in([:data, :spectators], &Map.delete(&1, s_id))
+    |> update_in([:data, :monitors], &MC.demonitor_by_val(&1, {:user, s_id}))
+    |> update_in([:updates], &[ev | &1])
+  end
+
+  defp process_event({:move_spec_to_player, p_id, player_data} = ev, aggregate) do
+    player_data = Map.merge(%{ready?: false, asset_status: :ready}, player_data)
+
     player =
-      Map.merge(state.spectators[p_id], player_data)
+      Map.merge(aggregate.data.spectators[p_id], player_data)
       |> Map.delete(:join_queue_position)
 
-    state
-    |> Map.update!(:spectators, &Map.delete(&1, p_id))
-    |> put_in([:players, p_id], player)
+    aggregate
+    |> update_in([:data, :spectators], &Map.delete(&1, p_id))
+    |> put_in([:data, :players, p_id], player)
+    |> update_in([:updates], &[ev | &1])
   end
 
-  defp new_state_from_event({:move_player_to_spec, p_id, spec_data}, state) do
+  defp process_event({:move_player_to_spec, p_id, spec_data} = ev, aggregate) do
     spec =
-      Map.merge(state.players[p_id], spec_data)
+      Map.merge(aggregate.data.players[p_id], spec_data)
       |> Map.delete(:team)
 
-    state
-    |> Map.update!(:players, &Map.delete(&1, p_id))
-    |> put_in([:spectators, p_id], spec)
+    aggregate
+    |> update_in([:data, :players], &Map.delete(&1, p_id))
+    |> put_in([:data, :spectators, p_id], spec)
+    |> update_in([:updates], &[ev | &1])
   end
 
-  defp new_state_from_event({:update_lobby_name, new_name}, state),
-    do: Map.replace!(state, :name, new_name)
+  # given a state where the players may not be all on consecutive ally team and
+  # teams, re-assign all required player.team so that they are all consecutive
+  # player should never change ally team when doing so, only teams
+  # and since archon isn't really supported, this ends up only repacking the teams
+  defp process_event(:repack_players, aggregate) do
+    data = aggregate.data
 
-  defp new_state_from_event({:update_map_name, new_name}, state),
-    do: Map.replace!(state, :map_name, new_name)
+    repacked_players =
+      for {_at, at_idx} <- Enum.with_index(data.ally_team_config) do
+        Enum.filter(data.players, fn {_, %{team: {p_at, _, _}}} -> at_idx == p_at end)
+        |> Enum.map(fn {_, p} -> p end)
+        |> Enum.sort_by(& &1.team)
+        |> Enum.with_index()
+        |> Enum.map(fn {p, idx} -> {p.id, Map.update!(p, :team, &put_elem(&1, 1, idx))} end)
+      end
+      |> List.flatten()
+      |> Enum.into(%{})
 
-  defp new_state_from_event({:update_ally_team_config, _, new_config}, state),
-    do: Map.replace!(state, :ally_team_config, new_config)
+    events =
+      Enum.map(repacked_players, fn {p_id, p} ->
+        if data.players[p_id].team != p.team do
+          {:move_player, p_id, p.team}
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    aggregate
+    |> put_in([:data, :players], repacked_players)
+    |> update_in([:updates], &(events ++ &1))
+  end
+
+  defp process_event(:fill_from_join_queue, aggregate) do
+    case add_player_from_join_queue(aggregate.data) do
+      nil ->
+        aggregate
+
+      ev ->
+        new_aggregate = process_event(ev, aggregate)
+        process_event(:fill_from_join_queue, new_aggregate)
+    end
+  end
+
+  defp process_event({:update_client_status, p_id, changes} = ev, aggregate) do
+    aggregate
+    |> update_in([:data, :players, p_id], &Map.merge(&1, changes))
+    |> update_in([:updates], &[ev | &1])
+  end
+
+  defp process_event({:update_lobby_name, new_name} = ev, aggregate) do
+    aggregate
+    |> put_in([:data, :name], new_name)
+    |> update_in([:updates], &[ev | &1])
+  end
+
+  defp process_event({:update_map_name, new_name} = ev, aggregate) do
+    aggregate
+    |> put_in([:data, :map_name], new_name)
+    |> update_in([:updates], &[ev | &1])
+  end
+
+  defp process_event({:update_ally_team_config, _, new_config} = ev, aggregate) do
+    state = aggregate.data
+
+    spec_ids =
+      Enum.map(state.players, fn {p_id, %{team: {x, y, z}}} ->
+        with at_config when not is_nil(at_config) <- Enum.at(new_config, x),
+             team_config when not is_nil(team_config) <- Enum.at(at_config.teams, y) do
+          if y < at_config.max_teams && z < team_config.max_players,
+            do: nil,
+            else: p_id
+        else
+          nil -> p_id
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    {bot_ids, player_ids} = Enum.split_with(spec_ids, &bot_id?/1)
+
+    position_offset =
+      case get_first_player_in_join_queue(state.spectators) do
+        nil -> 0
+        spec_id -> state.spectators[spec_id].join_queue_position - Enum.count(player_ids) - 1
+      end
+
+    spec_events =
+      Enum.with_index(player_ids, position_offset)
+      |> Enum.map(fn {p_id, pos} -> {:move_player_to_spec, p_id, %{join_queue_position: pos}} end)
+
+    bot_events = Enum.map(bot_ids, fn b_id -> {:remove_player_from_lobby, b_id} end)
+
+    events = spec_events ++ bot_events ++ [:repack_players, :fill_from_join_queue]
+
+    new_aggregate = process_events(events, Map.replace!(state, :ally_team_config, new_config))
+
+    # We put players in join queue, and then fill the teams with
+    # the join queue, which means we can have events like
+    # :move_player_to_spec and later :move_spec_to_player
+    # which would generate an update with %{spectators: %{x => nil}}
+    # where x was never a spectator to beging with.
+    # So we need to detect these events and replace the pair with a :move_player
+    # event instead.
+    added_ids =
+      Enum.map(new_aggregate.updates, fn
+        {:move_spec_to_player, id, _} -> id
+        _ -> nil
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    ids_to_fix = MapSet.intersection(MapSet.new(player_ids), MapSet.new(added_ids))
+
+    final_events =
+      Enum.map(new_aggregate.updates, fn ev ->
+        case ev do
+          {:move_player_to_spec, x, _} ->
+            if MapSet.member?(ids_to_fix, x),
+              do: nil,
+              else: ev
+
+          {:move_spec_to_player, x, data} ->
+            if MapSet.member?(ids_to_fix, x),
+              do: {:move_player, x, data.team},
+              else: ev
+
+          _ ->
+            ev
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    new_aggregate |> put_in([:updates], [ev | final_events] ++ aggregate.updates)
+  end
 
   # avoid sending a useless lobby list update when the last member of the lobby
   # just left. The caller of this function will detect the lobby is empty and
   # terminate the process, which will trigger the final lobby list update for
   # this lobby
-  @spec broadcast_updates([event()], state()) :: state()
-  defp broadcast_updates(_events, state)
-       when map_size(state.players) == 0 and map_size(state.spectators) == 0,
-       do: state
+  @spec broadcast_updates(aggregate()) :: aggregate()
+  defp broadcast_updates(%{data: data} = aggregate)
+       when map_size(data.players) == 0 and map_size(data.spectators) == 0,
+       do: aggregate
 
-  defp broadcast_updates(events, state) do
-    change_map = Enum.reduce(events, %{}, &update_change_from_event/2)
+  defp broadcast_updates(aggregate) do
+    change_map = Enum.reduce(aggregate.updates, %{}, &update_change_from_event/2)
 
-    broadcast_update({:update, nil, change_map}, state)
-    state
+    broadcast_update({:update, nil, change_map}, aggregate.data)
+    aggregate
   end
 
   defp update_change_from_event({:move_player, p_id, team}, change_map) do
     change_map
     |> Map.put_new(:players, %{})
     |> Map.update!(:players, fn players ->
-      players |> Map.put_new(p_id, %{}) |> put_in([p_id, :team], team)
+      players
+      |> Map.put_new(p_id, %{})
+      |> update_in([p_id], fn p ->
+        Map.merge(%{team: team, ready?: false, asset_status: :ready}, p)
+      end)
     end)
   end
 
@@ -905,6 +1218,8 @@ defmodule Teiserver.TachyonLobby.Lobby do
   end
 
   defp update_change_from_event({:move_spec_to_player, p_id, player_data}, change_map) do
+    player_data = Map.merge(%{ready?: false, asset_status: :ready}, player_data)
+
     change_map
     |> Map.put_new(:players, %{})
     |> put_in([:players, p_id], player_data)
@@ -918,6 +1233,14 @@ defmodule Teiserver.TachyonLobby.Lobby do
     |> put_in([:players, p_id], nil)
     |> Map.put_new(:spectators, %{})
     |> put_in([:spectators, p_id], spec_data)
+  end
+
+  defp update_change_from_event(:repack_players, change_map), do: change_map
+
+  defp update_change_from_event({:update_client_status, p_id, changes}, change_map) do
+    change_map
+    |> Map.put_new(:players, %{})
+    |> put_in([:players, p_id], changes)
   end
 
   defp update_change_from_event({:update_lobby_name, new_name}, change_map),
@@ -1120,12 +1443,15 @@ defmodule Teiserver.TachyonLobby.Lobby do
       Enum.filter(state.players, fn {_bot_id, b} -> Map.get(b, :host_user_id) == user_id end)
       |> Enum.map(&elem(&1, 0))
 
-    events = remove_players_from_lobby([user_id | bot_ids_to_remove], state)
-    state = new_state_from_events(events, state)
-    {final_state, fill_events} = fill_players_from_join_queue(state)
+    events =
+      Enum.map([user_id | bot_ids_to_remove], fn id -> {:remove_player_from_lobby, id} end) ++
+        [
+          :repack_players,
+          :fill_from_join_queue
+        ]
 
-    broadcast_updates(events ++ fill_events, final_state)
-    broadcast_player_count_change(final_state)
+    aggregate = process_events(events, state) |> broadcast_updates()
+    broadcast_player_count_change(aggregate.data)
   end
 
   @spec remove_spectator_from_lobby(T.userid(), state()) :: state()
@@ -1134,76 +1460,12 @@ defmodule Teiserver.TachyonLobby.Lobby do
       Enum.filter(state.players, fn {_bot_id, b} -> Map.get(b, :host_user_id) == user_id end)
       |> Enum.map(&elem(&1, 0))
 
-    events = remove_players_from_lobby(bot_ids_to_remove, state)
-    events = [{:remove_spec_from_lobby, user_id} | events]
+    events =
+      Enum.map(bot_ids_to_remove, fn id -> {:remove_player_from_lobby, id} end) ++
+        [{:remove_spec_from_lobby, user_id}, :repack_players, :fill_from_join_queue]
 
-    state = new_state_from_events(events, state)
-    {final_state, fill_events} = fill_players_from_join_queue(state)
-
-    broadcast_updates(events ++ fill_events, final_state)
-    broadcast_player_count_change(final_state)
-  end
-
-  # pure function that remove the given user from the players and adjust
-  # all ally teams and teams to account for that so that there is no gap
-  # in teams and ally teams.
-  # for example, if an ally team looks like [p1, p2, p3] and p2 leaves, then
-  # p3 will get adjusted so that its team is {0,1,0} leading to [p1, p3]
-  # because this function is called in different contexts where what happens
-  # to the removed player can change, the events returned do not include anything
-  # related to the given player.
-  # It is the responsability of the caller to add the correct event, which
-  # can be remove from lobby, move to a different team, or become a spectator
-  @spec do_remove_player(T.userid(), %{player_id() => player() | bot()}) :: [event()]
-  # {%{player_id() => player() | bot()}, %{player_id() => %{team: team} | nil}}
-  defp do_remove_player(user_id, players) do
-    {%{team: {at_idx, t_idx, p_idx}}, players} =
-      Map.pop!(players, user_id)
-
-    # reorg the other players to keep the team indices consecutive
-    # ally team won't change
-    changes =
-      Enum.reduce(players, [], fn {p_id, p}, player_changes ->
-        {x, y, z} = p.team
-
-        cond do
-          x == at_idx && y >= t_idx && p_idx == 0 ->
-            # p_idx == 0 means the player removed was the last one on their team
-            # so its team can be "removed", and all teams with a higher index should
-            # be moved back by 1
-            team = {x, y - 1, z}
-
-            [{:move_player, p_id, team} | player_changes]
-
-          x == at_idx && y >= t_idx && z >= p_idx ->
-            # similar there, but we only shuffle the players in the same team (archons)
-            team = {x, y, z - 1}
-
-            [{:move_player, p_id, team} | player_changes]
-
-          true ->
-            player_changes
-        end
-      end)
-
-    changes
-  end
-
-  # remove the given players from lobby completely
-  # it has to compute the intermediate states that will be thrown away
-  # so it's not optimal on this side, maybe revisit that later if lobbies
-  # prove to eat too much cpu (I highly doubt it will be the case)
-  @spec remove_players_from_lobby([T.userid()], state()) :: [event()]
-  defp remove_players_from_lobby(player_ids, state) do
-    {_, events} =
-      Enum.reduce(player_ids, {state, []}, fn player_id, {state, events} ->
-        new_events = do_remove_player(player_id, state.players)
-        new_events = [{:remove_player_from_lobby, player_id} | new_events]
-        new_state = new_state_from_events(new_events, state)
-        {new_state, events ++ new_events}
-      end)
-
-    events
+    aggregate = process_events(events, state) |> broadcast_updates()
+    broadcast_player_count_change(aggregate.data)
   end
 
   # Add the first player from the join queue to the player list and returns the
@@ -1222,7 +1484,7 @@ defmodule Teiserver.TachyonLobby.Lobby do
               nil
 
             team ->
-              {id, %{team: team}}
+              {id, %{team: team, ready?: false, asset_status: :ready}}
           end
       end
 
@@ -1232,17 +1494,6 @@ defmodule Teiserver.TachyonLobby.Lobby do
 
       {id, player_data} ->
         {:move_spec_to_player, id, player_data}
-    end
-  end
-
-  defp fill_players_from_join_queue(state, events \\ []) do
-    case add_player_from_join_queue(state) do
-      nil ->
-        {state, Enum.reverse(events)}
-
-      event ->
-        state = new_state_from_event(event, state)
-        fill_players_from_join_queue(state, [event | events])
     end
   end
 
@@ -1311,8 +1562,9 @@ defmodule Teiserver.TachyonLobby.Lobby do
     }
   end
 
-  @spec update_property(atom(), term(), state()) :: {:ok, [event()]} | {:error, String.t()}
-  defp update_property(:name, new_name, _state) do
+  @spec update_property(atom(), term(), state(), T.userid()) ::
+          {:ok, [event()]} | {:error, String.t()}
+  defp update_property(:name, new_name, _state, _user_id) do
     # we can expand lobby name validation later
     if new_name == "" do
       {:error, "name must not be empty"}
@@ -1321,79 +1573,14 @@ defmodule Teiserver.TachyonLobby.Lobby do
     {:ok, [{:update_lobby_name, new_name}]}
   end
 
-  defp update_property(:map_name, new_name, _state),
+  defp update_property(:map_name, new_name, _state, _user_id),
     do: {:ok, [{:update_map_name, new_name}]}
 
-  defp update_property(:ally_team_config, new_config, state) do
-    spec_ids =
-      Enum.map(state.players, fn {p_id, %{team: {x, y, z}}} ->
-        with at_config when not is_nil(at_config) <- Enum.at(new_config, x),
-             team_config when not is_nil(team_config) <- Enum.at(at_config.teams, y) do
-          if y < at_config.max_teams && z < team_config.max_players,
-            do: nil,
-            else: p_id
-        else
-          nil -> p_id
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-
-    {bot_ids, player_ids} = Enum.split_with(spec_ids, &bot_id?/1)
-
-    position_offset =
-      case get_first_player_in_join_queue(state.spectators) do
-        nil -> 0
-        spec_id -> state.spectators[spec_id].join_queue_position - Enum.count(player_ids) - 1
-      end
-
-    spec_events =
-      Enum.with_index(player_ids, position_offset)
-      |> Enum.map(fn {p_id, pos} -> {:move_player_to_spec, p_id, %{join_queue_position: pos}} end)
-
-    bot_events = Enum.map(bot_ids, fn b_id -> {:remove_player_from_lobby, b_id} end)
-
-    remove_events = [
-      {:update_ally_team_config, state.ally_team_config, new_config} | spec_events ++ bot_events
-    ]
-
-    state = new_state_from_events(remove_events, state)
-
-    {_final_state, add_events} = fill_players_from_join_queue(state)
-
-    # We put players in join queue, and then fill the teams with
-    # the join queue, which means we can have events like
-    # :move_player_to_spec and later :move_spec_to_player
-    # which would generate an update with %{spectators: %{x => nil}}
-    # where x was never a spectator to beging with.
-    # So we need to detect these events and replace the pair with a :move_player
-    # event instead.
-    added_ids = Enum.map(add_events, fn {:move_spec_to_player, id, _} -> id end)
-
-    ids_to_fix = MapSet.intersection(MapSet.new(player_ids), MapSet.new(added_ids))
-
-    final_events =
-      Enum.map(remove_events ++ add_events, fn ev ->
-        case ev do
-          {:move_player_to_spec, x, _} ->
-            if MapSet.member?(ids_to_fix, x),
-              do: nil,
-              else: ev
-
-          {:move_spec_to_player, x, data} ->
-            if MapSet.member?(ids_to_fix, x),
-              do: {:move_player, x, data.team},
-              else: ev
-
-          _ ->
-            ev
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-
-    {:ok, final_events}
+  defp update_property(:ally_team_config, new_config, state, _user_id) do
+    {:ok, [{:update_ally_team_config, state.ally_team_config, new_config}]}
   end
 
-  defp update_property(prop, _, _), do: {:error, "update #{prop} is not supported"}
+  defp update_property(prop, _, _, _), do: {:error, "update #{prop} is not supported"}
 
   @doc """
   apply some updates onto a base map according to json merge patch semantics

@@ -7,7 +7,7 @@ defmodule Teiserver.Account do
   alias Phoenix.PubSub
   alias Teiserver.Helper.QueryHelpers
   alias Teiserver.Game.MatchRatingLib
-  alias Teiserver.Account.{User, UserLib, TOTP, TOTPLib}
+  alias Teiserver.Account.{User, UserLib, TOTP, TOTPLib, LoginThrottleServer}
 
   @spec icon :: String.t()
   def icon, do: "fa-solid fa-user-alt"
@@ -26,16 +26,16 @@ defmodule Teiserver.Account do
   @spec count_users(list) :: integer
   defdelegate count_users(args), to: UserLib
 
-  @spec get_user!(non_neg_integer()) :: User.t()
+  @spec get_user!(T.userid()) :: User.t()
   defdelegate get_user!(user_id), to: UserLib
 
-  @spec get_user!(non_neg_integer(), list) :: User.t() | nil
+  @spec get_user!(T.userid(), keyword()) :: User.t() | nil
   defdelegate get_user!(user_id, args), to: UserLib
 
-  @spec get_user(non_neg_integer()) :: User.t() | nil
+  @spec get_user(T.userid()) :: User.t() | nil
   defdelegate get_user(user_id), to: UserLib
 
-  @spec get_user(non_neg_integer(), list) :: User.t() | nil
+  @spec get_user(T.userid() | nil, keyword()) :: User.t() | nil
   defdelegate get_user(user_id, args), to: UserLib
 
   @spec query_users(list) :: [User.t()]
@@ -2250,6 +2250,12 @@ defmodule Teiserver.Account do
   @spec call_client(T.userid(), any) :: any | nil
   defdelegate call_client(userid, msg), to: ClientLib
 
+  @spec count_client() :: non_neg_integer()
+  defdelegate count_client(), to: ClientLib
+
+  @spec count_non_bot_clients() :: non_neg_integer()
+  defdelegate count_non_bot_clients(), to: ClientLib
+
   # Party stuff
   alias Teiserver.Account.PartyLib
 
@@ -2335,4 +2341,7 @@ defmodule Teiserver.Account do
     can_register?() &&
       not Teiserver.Config.get_site_config_cache("teiserver.Require Chobby registration")
   end
+
+  defdelegate set_login_limit(limit), to: LoginThrottleServer
+  defdelegate reset_login_rate_limiter(rate), to: LoginThrottleServer, as: :reset_rate_limiter
 end

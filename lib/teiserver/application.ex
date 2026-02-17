@@ -29,7 +29,6 @@ defmodule Teiserver.Application do
         # Start phoenix pubsub
         {Phoenix.PubSub, name: Teiserver.PubSub},
         {Task.Supervisor, name: Teiserver.TaskSupervisor},
-        TeiserverWeb.Telemetry,
 
         # Start the Ecto repository
         Teiserver.Repo,
@@ -119,7 +118,7 @@ defmodule Teiserver.Application do
         concache_sup(:teiserver_clan_cache_bang),
 
         # Caches - Chat
-        concache_perm_sup(:rooms),
+        Teiserver.Chat.RoomSystem,
         {Teiserver.HookServer, name: Teiserver.HookServer},
 
         # Liveview throttles
@@ -154,7 +153,7 @@ defmodule Teiserver.Application do
         {Teiserver.Game.AchievementServer, name: Teiserver.Game.AchievementServer},
 
         # System throttle
-        {Teiserver.Account.LoginThrottleServer, name: Teiserver.Account.LoginThrottleServer},
+        Teiserver.Account.LoginThrottleServer,
 
         # this must be before Endpoint. Endpoint takes care of ws connection upgrade
         # and makes use of the tachyon systems spawned under this module.

@@ -5,20 +5,16 @@ defmodule Teiserver.BitParse do
   The reason being [0,0,1,0] and [0,0,0,0,1,0] would both be represented
   the same way with an integer
   """
+
+  @spec parse_bits(String.t(), non_neg_integer()) :: nonempty_list(0 | 1)
   def parse_bits(string, bit_length) do
-    result =
-      string
-      |> String.to_integer()
-      |> Integer.digits(2)
+    int = String.to_integer(string)
 
-    if bit_length > Enum.count(result) do
-      padding =
-        List.duplicate([0], bit_length - Enum.count(result))
-        |> List.flatten()
-
-      padding ++ result
+    if int == 0 do
+      List.duplicate(0, bit_length)
     else
-      result
+      min_len = :math.log2(int) |> :math.ceil() |> trunc
+      for <<(bit::1 <- <<int::size(max(bit_length, min_len))>>)>>, do: bit
     end
   end
 end

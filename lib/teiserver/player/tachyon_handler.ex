@@ -51,10 +51,16 @@ defmodule Teiserver.Player.TachyonHandler do
       initial_state |> Map.put(:sess_monitor, sess_monitor) |> Map.put(:pending_responses, %{})
 
     user = initial_state.user
-    Logger.metadata(user_id: user.id)
+    Logger.metadata(actor_type: :connection, actor_id: to_string(user.id))
 
     event = build_user_self_event(user, sess_state)
     {:event, "user/self", event, state}
+  end
+
+  def force_disconnect(nil), do: :ok
+
+  def force_disconnect(pid) when is_pid(pid) do
+    send(pid, :force_disconnect)
   end
 
   @impl Handler
@@ -224,7 +230,13 @@ defmodule Teiserver.Player.TachyonHandler do
     {:stop, :normal, state}
   end
 
-  def handle_info(%{}, state) do
+  def handle_info(:force_disconnect, state) do
+    # credo:disable-for-next-line Credo.Check.Design.TagTODO
+    # TODO: send a proper tachyon message to inform the client it is getting disconnected
+    {:stop, :normal, state}
+  end
+
+  def handle_info(_msg, state) do
     {:ok, state}
   end
 
@@ -814,6 +826,19 @@ defmodule Teiserver.Player.TachyonHandler do
     end
   end
 
+  def handle_command("lobby/updateClientStatus", "request", _msg_id, %{"data" => data}, state) do
+    mappings = %{"isReady" => :ready?, "assetStatus" => {:asset_status, &parse_asset_status/1}}
+    change_status = Collections.transform_map(data, mappings)
+
+    case Player.Session.lobby_update_client_status(state.user.id, change_status) do
+      :ok ->
+        {:response, state}
+
+      {:error, reason} ->
+        {:error_response, :invalid_request, to_string(reason), state}
+    end
+  end
+
   def handle_command("lobby/startBattle", "request", _msg_id, _msg, state) do
     case Player.Session.lobby_start_battle(state.user.id) do
       :ok ->
@@ -895,7 +920,8 @@ defmodule Teiserver.Player.TachyonHandler do
           :died ->
             setup_session(user)
 
-          {:ok, sess_state} ->
+          {:ok, old_conn_pid, sess_state} ->
+            force_disconnect(old_conn_pid)
             {:ok, _} = Player.Registry.register_and_kill_existing(user.id)
             {:ok, pid, sess_state}
         end
@@ -949,6 +975,15 @@ defmodule Teiserver.Player.TachyonHandler do
     end
   end
 
+  defp parse_asset_status(status) do
+    # the json schema validation already prevent values outside this enum
+    case status do
+      "missing" -> :missing
+      "downloading" -> :downloading
+      "ready" -> :ready
+    end
+  end
+
   @spec get_user(String.t()) :: {:ok, T.user()} | {:error, :invalid_user}
   defp get_user(raw_id) do
     with {:ok, user_id} <- TachyonParser.parse_user_id(raw_id),
@@ -992,17 +1027,17 @@ defmodule Teiserver.Player.TachyonHandler do
     %{
       id: party_state.id,
       members:
-        Enum.map(party_state.members, fn m ->
+        Enum.map(party_state.members, fn {_id, m} ->
           %{
             userId: to_string(m.id),
             joinedAt: DateTime.to_unix(m.joined_at, :microsecond)
           }
         end),
       invited:
-        Enum.map(party_state.invited, fn m ->
+        Enum.map(party_state.invited, fn {_id, m} ->
           %{
             userId: to_string(m.id),
-            invitedAt: DateTime.to_unix(m.invited_at)
+            invitedAt: DateTime.to_unix(m.invited_at, :microsecond)
           }
         end)
     }
@@ -1107,9 +1142,15 @@ defmodule Teiserver.Player.TachyonHandler do
         Map.put(m, to_string(p_id), nil)
 
       {p_id, player_updates}, m ->
+        mappings = %{
+          ready?: :isReady,
+          asset_status: :assetStatus
+        }
+
         val =
           get_tachyon_teams(player_updates)
           |> Map.put(:id, to_string(p_id))
+          |> Map.merge(Collections.transform_map(player_updates, mappings))
 
         Map.put(m, to_string(p_id), val)
     end)

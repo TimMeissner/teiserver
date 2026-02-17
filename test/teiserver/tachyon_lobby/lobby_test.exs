@@ -3,6 +3,7 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
   import Teiserver.Support.Polling, only: [poll_until_some: 1, poll_until_nil: 1]
   alias Teiserver.TachyonLobby, as: Lobby
   alias Teiserver.AssetFixtures
+  alias Teiserver.Tachyon
 
   @moduletag :tachyon
 
@@ -152,10 +153,12 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
 
     test "works" do
       {:ok, sink_pid} = Task.start_link(:timer, :sleep, [:infinity])
-      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([1, 1]))
+      {:ok, _pid, %{id: id} = create_details} = Lobby.create(mk_start_params([1, 1]))
+      assert %{ready?: false, asset_status: :ready} = create_details.players[@default_user_id]
       {:ok, _, _details} = Lobby.join(id, mk_player("user2"), sink_pid)
       {:ok, details} = Lobby.join_ally_team(id, "user2", 1)
       assert %{team: {1, _, _}} = details.players["user2"]
+      assert %{ready?: false, asset_status: :ready} = details.players["user2"]
 
       # is idempotent
       {:ok, details2} = Lobby.join_ally_team(id, "user2", 1)
@@ -171,7 +174,10 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       {:ok, _, _details} = Lobby.join(id, mk_player("user2"))
       {:ok, _details} = Lobby.join_ally_team(id, "user2", 1)
 
-      expected = %{players: %{"user2" => %{team: {1, 0, 0}}}, spectators: %{"user2" => nil}}
+      expected = %{
+        players: %{"user2" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready}},
+        spectators: %{"user2" => nil}
+      }
 
       assert_receive {:lobby, ^id, {:updated, ^expected}}
     end
@@ -211,7 +217,7 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       {:ok, details} = Lobby.join_ally_team(id, "user2", 0)
 
       expected_update = %{
-        players: %{"user2" => %{team: {0, 1, 0}}},
+        players: %{"user2" => %{team: {0, 1, 0}, ready?: false, asset_status: :ready}},
         spectators: %{"user2" => nil}
       }
 
@@ -297,7 +303,12 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
 
       :ok = Lobby.leave(id, "user2")
 
-      expected = %{players: %{"user2" => nil, "user3" => %{team: {1, 0, 0}}}}
+      expected = %{
+        players: %{
+          "user2" => nil,
+          "user3" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready}
+        }
+      }
 
       assert_received {:lobby, ^id, {:updated, ^expected}}
     end
@@ -487,7 +498,10 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       :ok = Lobby.spectate(id, "2")
       assert_receive {:lobby, ^id, {:updated, updates}}
 
-      assert %{spectators: %{"3" => nil}, players: %{"3" => %{team: {1, 0, 0}}}} = updates
+      assert %{
+               spectators: %{"3" => nil},
+               players: %{"3" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready}}
+             } = updates
     end
 
     test "join team when player leaves the lobby" do
@@ -502,7 +516,12 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       :ok = Lobby.leave(id, "2")
       assert_receive {:lobby, ^id, {:updated, updates}}
 
-      assert %{players: %{"2" => nil, "3" => %{team: {1, 0, 0}}}} = updates
+      assert %{
+               players: %{
+                 "2" => nil,
+                 "3" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready}
+               }
+             } = updates
     end
 
     test "join team when player disappear" do
@@ -518,7 +537,12 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       Process.exit(ctx[:users]["2"].pid, :kill)
       assert_receive {:lobby, ^id, {:updated, updates}}
 
-      assert %{players: %{"3" => %{team: {1, 0, 0}}, "2" => nil}} = updates
+      assert %{
+               players: %{
+                 "3" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready},
+                 "2" => nil
+               }
+             } = updates
     end
 
     test "spec queue positions works" do
@@ -855,7 +879,13 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       :ok =
         Lobby.update_properties(id, @default_user_id, %{ally_team_config: new_ally_team_config})
 
-      assert_receive {:lobby, ^id, {:updated, %{players: %{"2" => %{team: {1, 0, 0}}}}}}
+      assert_receive {:lobby, ^id,
+                      {:updated,
+                       %{
+                         players: %{
+                           "2" => %{team: {1, 0, 0}, ready?: false, asset_status: :ready}
+                         }
+                       }}}
     end
 
     test "put extra players in join queue" do
@@ -954,6 +984,141 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
       } = update
 
       refute is_nil(pos), "player is now in join queue"
+    end
+  end
+
+  describe "state restoration" do
+    def setup_restore_config(_) do
+      Tachyon.enable_state_restoration()
+      ExUnit.Callbacks.on_exit(fn -> Tachyon.disable_state_restoration() end)
+    end
+
+    setup [:setup_restore_config]
+
+    test "no snapshot when normal exit" do
+      sink_pid = mk_sink()
+
+      {:ok, _pid, %{id: id}} =
+        mk_start_params([1, 1]) |> Map.put(:creator_pid, sink_pid) |> Lobby.create()
+
+      Tachyon.restart_system()
+      assert Teiserver.KvStore.get("lobby", id) == nil
+    end
+
+    test "can rejoin lobby from snapshot" do
+      sink_pid = mk_sink()
+
+      {:ok, _pid, %{id: id}} =
+        mk_start_params([1, 1]) |> Map.put(:creator_pid, sink_pid) |> Lobby.create()
+
+      Process.exit(sink_pid, :shutdown)
+      Tachyon.restart_system()
+
+      sink_pid = mk_sink()
+      {:ok, _, details} = Lobby.rejoin(id, @default_user_id, sink_pid)
+      assert is_map_key(details.players, @default_user_id)
+    end
+
+    test "must rejoin first before being able to leave" do
+      sink_pid = mk_sink()
+
+      {:ok, _pid, %{id: id}} =
+        mk_start_params([1, 1]) |> Map.put(:creator_pid, sink_pid) |> Lobby.create()
+
+      Process.exit(sink_pid, :shutdown)
+      Tachyon.restart_system()
+
+      # another player is attempting to join before the lobby is fully up
+      join_task =
+        Task.async(fn ->
+          {:ok, _, _details} = Lobby.join(id, mk_player("other-user-id"))
+          :ok
+        end)
+
+      # timeout
+      assert Task.yield(join_task, 10) == nil
+
+      sink_pid = mk_sink()
+      {:ok, _, details} = Lobby.rejoin(id, @default_user_id, sink_pid)
+      assert is_map_key(details.players, @default_user_id)
+
+      # now the call is handled
+      assert Task.await(join_task) == :ok
+    end
+
+    test "list updates when lobby is restored" do
+      assert {_initial_counter, %{}} = Lobby.subscribe_updates()
+      sink_pid = mk_sink()
+
+      {:ok, _pid, %{id: id}} =
+        mk_start_params([1, 1]) |> Map.put(:creator_pid, sink_pid) |> Lobby.create()
+
+      drain_msg_queue()
+
+      Process.exit(sink_pid, :shutdown)
+      Tachyon.restart_system()
+
+      sink_pid = mk_sink()
+      {:ok, _, _details} = Lobby.rejoin(id, @default_user_id, sink_pid)
+      assert_receive %{event: :reset_list, lobbies: lobbies}
+      assert lobbies == %{}
+
+      Lobby.List.broadcast_updates()
+      assert_receive %{event: :add_lobby, lobby_id: ^id}
+    end
+  end
+
+  describe "update player status" do
+    test "must be valid lobby" do
+      {:error, :invalid_lobby} = Lobby.update_client_status("nolobby", "user1", %{ready?: true})
+    end
+
+    test "must be in lobby" do
+      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([2, 2]))
+      {:error, :not_in_lobby} = Lobby.update_client_status(id, "user1", %{ready?: true})
+    end
+
+    test "can update properties one by one" do
+      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([2, 2]))
+      :ok = Lobby.update_client_status(id, @default_user_id, %{ready?: true})
+      expected = %{players: %{@default_user_id => %{ready?: true}}}
+      assert_receive {:lobby, ^id, {:updated, ^expected}}
+
+      :ok = Lobby.update_client_status(id, @default_user_id, %{asset_status: :downloading})
+      expected = %{players: %{@default_user_id => %{asset_status: :downloading}}}
+      assert_receive {:lobby, ^id, {:updated, ^expected}}
+    end
+
+    test "can update multiple properties at once" do
+      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([2, 2]))
+
+      :ok =
+        Lobby.update_client_status(id, @default_user_id, %{
+          ready?: true,
+          asset_status: :downloading
+        })
+
+      expected = %{players: %{@default_user_id => %{ready?: true, asset_status: :downloading}}}
+      assert_receive {:lobby, ^id, {:updated, ^expected}}
+    end
+
+    # in the future we may want to avoid sending events if there is no changes
+    # it would cost a bit more cpu to potentially save a few messages, but this
+    # could also be handled by client. For now, keep implementation simple
+    # and always process the request
+    test "send event if no changes" do
+      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([2, 2]))
+      :ok = Lobby.update_client_status(id, @default_user_id, %{ready?: false})
+      expected = %{players: %{@default_user_id => %{ready?: false}}}
+      assert_receive {:lobby, ^id, {:updated, ^expected}}, 30
+    end
+
+    test "only player can update status" do
+      {:ok, _pid, %{id: id}} = Lobby.create(mk_start_params([1, 1]))
+      {:ok, sink_pid} = Task.start_link(:timer, :sleep, [:infinity])
+      {:ok, _, _details} = Lobby.join(id, mk_player("other-user-id"), sink_pid)
+
+      {:error, :not_a_player} = Lobby.update_client_status(id, "other-user-id", %{ready?: true})
     end
   end
 
@@ -1127,5 +1292,10 @@ defmodule Teiserver.TachyonLobby.LobbyTest do
     after
       timeout -> Enum.reverse(acc)
     end
+  end
+
+  defp mk_sink(name \\ :sink) do
+    Supervisor.child_spec({Task, fn -> :timer.sleep(:infinity) end}, id: name)
+    |> ExUnit.Callbacks.start_supervised!()
   end
 end

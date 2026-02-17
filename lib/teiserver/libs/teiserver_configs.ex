@@ -296,7 +296,19 @@ defmodule Teiserver.TeiserverConfigs do
       permissions: ["Admin"],
       description: "The cap for number of concurrent users",
       default: 1000,
-      value_label: ""
+      value_label: "",
+      update_callback: fn rate -> Teiserver.Account.set_login_limit(rate) end
+    })
+
+    add_site_config_type(%{
+      key: "system.Login rate",
+      section: "Login",
+      type: "integer",
+      permissions: ["Admin"],
+      description: "How many user per seconds should be able to log in",
+      default: 2,
+      value_label: "",
+      update_callback: fn rate -> Teiserver.Account.reset_login_rate_limiter(rate) end
     })
 
     add_site_config_type(%{
@@ -725,6 +737,7 @@ defmodule Teiserver.TeiserverConfigs do
   end
 
   defp tachyon_configs do
+    Teiserver.Tachyon.setup_site_configs()
     Teiserver.Party.setup_site_configs()
     :ok
   end

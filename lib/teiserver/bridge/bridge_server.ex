@@ -41,7 +41,7 @@ defmodule Teiserver.Bridge.BridgeServer do
     send(bridge_pid, message)
   end
 
-  @spec send_direct_message(T.user_id(), String.t()) :: :ok | nil
+  @spec send_direct_message(T.userid(), String.t()) :: :ok | nil
   def send_direct_message(userid, message) do
     user = Account.get_user_by_id(userid)
 
@@ -402,7 +402,7 @@ defmodule Teiserver.Bridge.BridgeServer do
     |> String.replace(Map.keys(emoticon_map), fn text -> emoticon_map[text] end)
   end
 
-  @spec get_bridge_account() :: Teiserver.Account.CacheUser.t()
+  @spec get_bridge_account() :: Teiserver.CacheUser.t()
   def get_bridge_account() do
     user =
       Account.get_user(nil,
