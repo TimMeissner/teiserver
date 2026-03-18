@@ -3,8 +3,12 @@ defmodule TeiserverWeb.Admin.UserController do
   require Logger
   use TeiserverWeb, :controller
 
-  alias Teiserver.{Account, Chat, Game}
-  alias Teiserver.Account.{UserLib, RoleLib, TOTPLib}
+  alias Teiserver.Account
+  alias Teiserver.Chat
+  alias Teiserver.Game
+  alias Teiserver.Account.UserLib
+  alias Teiserver.Account.RoleLib
+  alias Teiserver.Account.TOTPLib
   alias Teiserver.Battle.BalanceLib
   alias Teiserver.Game.MatchRatingLib
   import Teiserver.Helper.NumberHelper, only: [int_parse: 1, float_parse: 1]
@@ -324,7 +328,6 @@ defmodule TeiserverWeb.Admin.UserController do
       Map.merge(user.data || %{}, %{
         "bot" => Enum.member?(permissions, "Bot"),
         "moderator" => Enum.member?(permissions, "Moderator"),
-        "verified" => user_params["verified"] == "true",
         "roles" => new_roles
       })
 

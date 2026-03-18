@@ -2,19 +2,15 @@ defmodule TeiserverWeb.TachyonControllerTest do
   use TeiserverWeb.ConnCase
   alias Central.Helpers.GeneralTestLib
   alias Teiserver.OAuthFixtures
-  alias Teiserver.Support.{Tachyon, Polling}
+  alias Teiserver.Support.Tachyon
+  alias Teiserver.Support.Polling
 
   alias WebsocketSyncClient, as: WSC
 
   defp setup_conn(_context) do
     conn = Phoenix.ConnTest.build_conn()
 
-    user =
-      GeneralTestLib.make_user(%{
-        "data" => %{
-          "roles" => ["Verified"]
-        }
-      })
+    user = GeneralTestLib.make_user(%{"roles" => ["Verified"]})
 
     {:ok, conn: conn, user: user}
   end
@@ -81,8 +77,8 @@ defmodule TeiserverWeb.TachyonControllerTest do
     test "cannot connect if user is banned", %{conn: conn} do
       user =
         GeneralTestLib.make_user(%{
+          "roles" => ["Verified"],
           "data" => %{
-            "roles" => ["Verified"],
             "restrictions" => ["Permanently banned"]
           }
         })
@@ -109,8 +105,8 @@ defmodule TeiserverWeb.TachyonControllerTest do
     test "cannot connect if user is suspended", %{conn: conn} do
       user =
         GeneralTestLib.make_user(%{
+          "roles" => ["Verified"],
           "data" => %{
-            "roles" => ["Verified"],
             "restrictions" => ["Login"]
           }
         })

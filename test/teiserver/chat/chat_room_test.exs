@@ -2,13 +2,13 @@ defmodule Teiserver.Chat.ChatRoomTest do
   use Teiserver.DataCase
 
   alias Phoenix.PubSub
-  alias Teiserver.Room
   alias Teiserver.Chat
+  alias Teiserver.Room
 
   setup do
     :ok = Supervisor.terminate_child(Teiserver.Supervisor, Teiserver.Chat.RoomSystem)
     {:ok, _pid} = Supervisor.restart_child(Teiserver.Supervisor, Teiserver.Chat.RoomSystem)
-    user = Central.Helpers.GeneralTestLib.make_user(%{"data" => %{"roles" => ["Verified"]}})
+    user = Central.Helpers.GeneralTestLib.make_user(%{"roles" => ["Verified"]})
 
     {:ok, user: user}
   end

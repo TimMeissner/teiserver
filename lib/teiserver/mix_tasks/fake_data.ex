@@ -5,7 +5,10 @@ defmodule Mix.Tasks.Teiserver.Fakedata do
 
   use Mix.Task
 
-  alias Teiserver.{Account, Logging, Battle, Moderation}
+  alias Teiserver.Account
+  alias Teiserver.Logging
+  alias Teiserver.Battle
+  alias Teiserver.Moderation
   alias Teiserver.Helper.StylingHelper
   alias Teiserver.Battle.MatchLib
   alias Teiserver.Game.MatchRatingLib
@@ -102,8 +105,7 @@ defmodule Mix.Tasks.Teiserver.Fakedata do
             roles: ["Verified"],
             data: %{
               lobby_client: "FakeData",
-              bot: false,
-              roles: ["Verified"]
+              bot: false
             },
             inserted_at:
               Timex.shift(Timex.now(), days: -day, minutes: -minutes) |> time_convert(),

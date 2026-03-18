@@ -1,5 +1,6 @@
 defmodule Teiserver.Account.NewSmurfReport do
-  alias Teiserver.{Account, CacheUser}
+  alias Teiserver.Account
+  alias Teiserver.CacheUser
   import Teiserver.Helper.NumberHelper, only: [int_parse: 1]
   require Logger
 
@@ -28,7 +29,7 @@ defmodule Teiserver.Account.NewSmurfReport do
           last_played_after: Timex.now() |> Timex.shift(days: -max_play_age),
           inserted_after: Timex.now() |> Timex.shift(days: -max_account_age),
           smurf_of: false,
-          verified: true
+          has_role: "Verified"
         ],
         limit: 1000,
         order_by: "Last played"

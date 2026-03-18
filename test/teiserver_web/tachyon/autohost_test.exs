@@ -1,9 +1,9 @@
 defmodule TeiserverWeb.Tachyon.Autohost do
   use TeiserverWeb.ConnCase, async: false
 
+  alias Teiserver.Autohost
   alias Teiserver.OAuthFixtures
   alias Teiserver.Support.Tachyon
-  alias Teiserver.Autohost
   alias WebsocketSyncClient, as: WSC
   import Teiserver.Support.Polling, only: [poll_until: 2, poll_until: 3]
 
@@ -17,7 +17,7 @@ defmodule TeiserverWeb.Tachyon.Autohost do
   def setup_autohost(_context), do: {:ok, autohost: Teiserver.BotFixtures.create_bot()}
 
   def setup_app(_context) do
-    user = Central.Helpers.GeneralTestLib.make_user(%{"data" => %{"roles" => ["Verified"]}})
+    user = Central.Helpers.GeneralTestLib.make_user(%{"roles" => ["Verified"]})
     uid = UUID.uuid4()
 
     app =
